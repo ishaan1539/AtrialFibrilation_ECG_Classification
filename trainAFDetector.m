@@ -9,6 +9,7 @@ arguments
     options.MaxPerClass (1,1) double {mustBePositive} = Inf
     options.Trees (1,1) double {mustBeInteger,mustBePositive} = 150
     options.Epochs (1,1) double {mustBeInteger,mustBePositive} = 12
+    options.RunZabihi (1,1) logical = false
     options.RunCNN (1,1) logical = true
     options.RunTunedForest (1,1) logical = true
     options.RunResNet (1,1) logical = true
@@ -166,6 +167,13 @@ if options.RunTunedForest
     rng(baselineRng);
 end
 
+if options.RunZabihi
+    [mdl,prediction,details] = fitZabihiForest(options.DataDir,ids,labels,trainRows,testRows,fs);
+    results.Models.ZabihiForest = mdl;
+    results.Zabihi = details;
+    results = addEvaluation(results,"ZabihiForest",actual,prediction,order);
+end
+
 if options.RunXGBoost
     counts = countcats(labels(trainRows));
     [~,labelIndex] = ismember(string(labels(trainRows)),classes);
@@ -236,6 +244,55 @@ if options.RunCNN
     results = addEvaluation(results,"CNN1D",actual,scores2label(recordingScores,order),order);
 end
 disp(results.Metrics);
+end
+
+function [model,prediction,details] = fitZabihiForest(dataDir,ids,labels,trainRows,testRows,fs)
+% Use the submission's signal features and train both forests locally.
+sourceDir = fullfile(fileparts(mfilename('fullpath')),"morteza-zabihi-208");
+originalPath = path;
+originalRng = rng;
+restorePath = onCleanup(@() path(originalPath));
+restoreRng = onCleanup(@() rng(originalRng));
+addpath(sourceDir);
+fprintf("Extracting Zabihi signal features for %d recordings.\n",numel(ids));
+for row = 1:numel(ids)
+    record = load(fullfile(dataDir,ids(row)+".mat"),"val");
+    try
+        rowFeatures = feature_extraction_BLACKSWAN(double(record.val),fs,false);
+    catch cause
+        failure = MException("AFDetector:ZabihiExtraction", ...
+            "Zabihi feature extraction failed for recording %s.",ids(row));
+        throw(addCause(failure,cause));
+    end
+    if row == 1
+        features = nan(numel(ids),numel(rowFeatures));
+    end
+    assert(numel(rowFeatures) == size(features,2), ...
+        "Unexpected Zabihi feature count for recording %s.",ids(row));
+    features(row,:) = rowFeatures(:).';
+    if mod(row,500) == 0
+        fprintf("Zabihi features: %d / %d\n", row,numel(ids));
+    end
+end
+features(~isfinite(features)) = NaN;
+fillValues = mean(features(trainRows,:),1,"omitnan");
+[missingRows,missingCols] = find(isnan(features));
+features(sub2ind(size(features),missingRows,missingCols)) = fillValues(missingCols);
+filledTraining = features(trainRows,:);
+usable = find(isfinite(fillValues) & std(filledTraining,0,1) > 0);
+assert(~isempty(usable),"No usable Zabihi features in the training split.");
+features = features(:,usable);
+rng(45,"twister");
+rankingForest = TreeBagger(150,features(trainRows,:),labels(trainRows), ...
+    Method="classification",SplitCriterion="deviance",OOBPredictorImportance="on");
+[~,ranking] = sort(rankingForest.OOBPermutedPredictorDeltaError,"descend");
+selected = ranking(1:min(150,numel(ranking)));
+model = TreeBagger(500,features(trainRows,selected),labels(trainRows), ...
+    Method="classification",SplitCriterion="deviance", ...
+    NumPredictorsToSample=min(30,numel(selected)));
+prediction = predict(model,features(testRows,selected));
+details = struct('SelectedColumns',usable(selected),'FillValues',fillValues(usable(selected)), ...
+    'ExtractedFeatureCount',numel(fillValues));
 end
 
 function [f,extra] = ecgFeatures(raw,x,fs,b,a)
