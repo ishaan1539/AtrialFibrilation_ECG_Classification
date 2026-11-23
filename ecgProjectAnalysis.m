@@ -10,14 +10,13 @@ assert(~isempty(projectIndex), ...
     "Could not locate training2017/REFERENCE.csv. Set MATLAB's Current Folder to Project_ECG.");
 projectFolder = projectCandidates(projectIndex);
 trainingFolder = fullfile(projectFolder, "training2017");
-butFolder = fullfile(getenv("HOME"), "Downloads");
+butFolder = fullfile(projectFolder, "butqdb");
 recordedFile = fullfile(projectFolder, "recordings", "ecg_20261123_151617_625.mat");
 recordedFs = 200;                % Assumed acquisition rate from the project comparison
 adcReferenceV = 5;              % Assumed Arduino ADC reference
 adcFullScaleCount = 1023;
 modelFs = 300;
 cutoffHz = 40;
-referenceWindowSeconds = 30;
 
 classes = ["N", "A", "O", "~"];
 featureNames = ["MedianBPM", "RRRelativeMAD", "RMSDeltaRR", ...
@@ -93,14 +92,14 @@ disp(perClass)
 disp(metrics)
 
 %% 3. Analyze BUT QDB Class 1 and predict with ForestFull
-[class1Raw, class1Fs, class1Start] = readBUTExample(butFolder, 1, referenceWindowSeconds);
+[class1Raw, class1Fs, class1Start] = readBUTExample(butFolder, 1);
 class1 = analyzeTrace(class1Raw, class1Fs, cutoffHz, false, ...
     sprintf("BUT QDB Class 1 at %.3f s", class1Start), "\muV");
 class1Predictions = comparePredictions(forestFull, class1Raw, class1Fs, ...
     modelFs, lowB, lowA, qrsB, qrsA);
 
 %% 4. Analyze BUT QDB Class 2 and predict with ForestFull
-[class2Raw, class2Fs, class2Start] = readBUTExample(butFolder, 2, referenceWindowSeconds);
+[class2Raw, class2Fs, class2Start] = readBUTExample(butFolder, 2);
 class2 = analyzeTrace(class2Raw, class2Fs, cutoffHz, false, ...
     sprintf("BUT QDB Class 2 at %.3f s", class2Start), "\muV");
 class2Predictions = comparePredictions(forestFull, class2Raw, class2Fs, ...
@@ -110,51 +109,24 @@ class2Predictions = comparePredictions(forestFull, class2Raw, class2Fs, ...
 recorded = load(recordedFile, "adcCounts");
 recordedVolts = double(recorded.adcCounts(:)) * (adcReferenceV / adcFullScaleCount);
 ownECG = analyzeTrace(recordedVolts, recordedFs, cutoffHz, true, ...
-    sprintf("Recorded ECG at assumed %g Hz (ADC input)", recordedFs), "V", [45 55]);
+    sprintf("Recorded ECG at assumed %g Hz (ADC input)", recordedFs), "V", [45 65]);
 
 
 % Local functions
 
-function [raw, fs, startSeconds] = readBUTExample(folder, quality, seconds)
-    header = splitlines(string(fileread(fullfile(folder, "100001_ECG.hea"))));
-    recordFields = split(strtrim(header(1)));
-    signalFields = split(strtrim(header(2)));
-    fs = str2double(recordFields(3));
-    sampleCount = str2double(recordFields(4));
-    calibration = regexp(char(signalFields(3)), '^([\d.]+)\((-?\d+)\)/uV$', ...
-        'tokens', 'once');
-    assert(str2double(recordFields(2)) == 1 && signalFields(2) == "16" && ...
-        isfinite(fs) && fs > 80 && ~isempty(calibration), "Unexpected BUT QDB header.");
-    gain = str2double(calibration{1});
-    baseline = str2double(calibration{2});
-    assert(gain > 0, "Invalid BUT QDB calibration.");
-
-    annotations = readmatrix(fullfile(folder, "100001_ANN.csv"), "NumHeaderLines", 0);
-    consensus = annotations(:, 10:12);
-    n = round(seconds * fs);
-    startIndex = find(consensus(:,3) == quality & ...
-        consensus(:,2) - consensus(:,1) + 1 >= n, 1);
-    assert(~isempty(startIndex), "Class %d has no %.1f s consensus interval.", quality, seconds);
-    % Center the preview within the selected interval and retain its source time.
-    interval = consensus(startIndex, 1:2);
-    firstSample = interval(1) + floor((interval(2) - interval(1) + 1 - n)/2);
-    assert(firstSample >= 1 && firstSample + n - 1 <= sampleCount, ...
-        "Annotation extends beyond the waveform.");
-    startSeconds = (firstSample - 1) / fs;
-
-    [fid, message] = fopen(fullfile(folder, "100001_ECG.dat"), "r", "ieee-le");
-    assert(fid >= 0, "Cannot open BUT QDB waveform: %s", message);
-    closeFile = onCleanup(@() fclose(fid)); %#ok<NASGU>
-    assert(fseek(fid, 2*(firstSample - 1), 'bof') == 0, "Could not seek to ECG segment.");
-    counts = fread(fid, n, 'int16=>double');
-    assert(numel(counts) == n && all(counts ~= -32768), ...
-        "BUT QDB segment is incomplete or contains WFDB missing samples.");
-    raw = (counts - baseline) / gain;
+function [raw, fs, startSeconds] = readBUTExample(folder, quality)
+    excerpt = load(fullfile(folder, sprintf("100001_class%d.mat", quality)));
+    fs = excerpt.sampleRateHz;
+    assert(excerpt.qualityClass == quality && fs == 1000 && ...
+        numel(excerpt.adcCounts) == 30*fs, "Unexpected Class %d ECG excerpt.", quality);
+    startSeconds = (excerpt.startSample - 1) / fs;
+    raw = (double(excerpt.adcCounts(:)) - excerpt.baselineCounts) / ...
+        excerpt.gainCountsPerMicrovolt;
 end
 
-function result = analyzeTrace(raw, fs, cutoff, invertFiltered, name, unit, diagnosticBandHz)
+function result = analyzeTrace(raw, fs, cutoff, invertFiltered, name, unit, bandstopHz)
     if nargin < 7
-        diagnosticBandHz = [];
+        bandstopHz = [];
     end
     raw = raw(:);
     [b, a] = butter(2, cutoff/(fs/2), "low");
@@ -165,12 +137,22 @@ function result = analyzeTrace(raw, fs, cutoff, invertFiltered, name, unit, diag
         filteredName = filteredName + ", inverted";
     end
 
-    [qrsB, qrsA] = butter(2, [5 20]/(fs/2), "bandpass");
-    [rawPeaks, ~] = qrsPeaks(raw, fs, qrsB, qrsA);
-    [filteredPeaks, ~] = qrsPeaks(filtered, fs, qrsB, qrsA);
-    peakLocations = {rawPeaks; filteredPeaks};
-    bpm = [estimatedBPM(rawPeaks, fs); estimatedBPM(filteredPeaks, fs)];
+    signals = [raw, filtered];
     stage = ["Raw"; filteredName];
+    if ~isempty(bandstopHz)
+        [stopB, stopA] = butter(2, bandstopHz/(fs/2), "stop");
+        signals(:,3) = filtfilt(stopB, stopA, filtered);
+        stage(3,1) = sprintf("%g Hz LP + %g–%g Hz stop", ...
+            cutoff, bandstopHz(1), bandstopHz(2));
+    end
+
+    [qrsB, qrsA] = butter(2, [5 20]/(fs/2), "bandpass");
+    peakLocations = cell(numel(stage), 1);
+    bpm = NaN(numel(stage), 1);
+    for i = 1:numel(stage)
+        peakLocations{i} = qrsPeaks(signals(:,i), fs, qrsB, qrsA);
+        bpm(i) = estimatedBPM(peakLocations{i}, fs);
+    end
     detectedBeats = cellfun(@numel, peakLocations);
     heartRate = table(stage, detectedBeats, bpm, ...
         VariableNames=["Signal", "DetectedQRSCandidates", "EstimatedBPM"]);
@@ -180,14 +162,6 @@ function result = analyzeTrace(raw, fs, cutoff, invertFiltered, name, unit, diag
     t = (0:numel(raw)-1)' / fs;
     windowLength = min(numel(raw), round(2*fs));
     window = hamming(windowLength, "periodic");
-    signals = [raw, filtered];
-    plotStage = stage;
-    if ~isempty(diagnosticBandHz)
-        % Inspect the band directly from the raw signal, before low-pass filtering.
-        [bandB, bandA] = butter(2, diagnosticBandHz/(fs/2), "bandpass");
-        signals(:,3) = filtfilt(bandB, bandA, raw);
-        plotStage(3,1) = sprintf("%g–%g Hz band-pass", diagnosticBandHz);
-    end
     % Remove DC before Welch. The default PSD for real data is one-sided.
     [psd, frequency] = pwelch(signals - mean(signals, 1), window, ...
         floor(windowLength/2), 2^nextpow2(windowLength), fs);
@@ -200,14 +174,10 @@ function result = analyzeTrace(raw, fs, cutoff, invertFiltered, name, unit, diag
     for i = 1:nTraces
         waveformAxes(i) = nexttile(i);
         plot(t, signals(:,i));
-        if i <= numel(peakLocations)
-            hold on
-            peaks = peakLocations{i};
-            plot(t(peaks), signals(peaks,i), "o", MarkerSize=4);
-            title(sprintf("%s | estimated %.1f bpm", plotStage(i), bpm(i)));
-        else
-            title(plotStage(i));
-        end
+        hold on
+        peaks = peakLocations{i};
+        plot(t(peaks), signals(peaks,i), "o", MarkerSize=4);
+        title(sprintf("%s | estimated %.1f bpm", stage(i), bpm(i)));
         xlabel("Time within recording segment (s)");
         ylabel("Voltage (" + unit + ")");
         grid on
@@ -215,27 +185,23 @@ function result = analyzeTrace(raw, fs, cutoff, invertFiltered, name, unit, diag
         spectrumAxes(i) = nexttile(i + nTraces);
         plot(frequency, 10*log10(max(psd(:,i), realmin)));
         xlim([0 min(150, fs/2)]);
-        title(plotStage(i) + " | Welch PSD");
+        title(stage(i) + " | Welch PSD");
         xlabel("Frequency (Hz)");
         ylabel("PSD (dB re " + unit + "^2/Hz)");
         grid on
     end
-    if isempty(diagnosticBandHz)
-        linkaxes(waveformAxes, "xy");
-    else
-        % The band-pass is centered near zero, unlike the ADC voltage.
-        linkaxes(waveformAxes, "x");
-    end
+    linkaxes(waveformAxes, "xy");
     linkaxes(spectrumAxes, "xy");
     sgtitle(name);
     result = struct("TimeSeconds", t, "RawVoltage", raw, "FilteredVoltage", filtered, ...
         "VoltageUnit", unit, "SampleRateHz", fs, "FrequencyHz", frequency, ...
         "RawPSD", psd(:,1), "FilteredPSD", psd(:,2), "HeartRate", heartRate, ...
-        "RawQRSCandidates", rawPeaks, "FilteredQRSCandidates", filteredPeaks);
-    if ~isempty(diagnosticBandHz)
-        result.DiagnosticBandHz = diagnosticBandHz;
-        result.BandpassVoltage = signals(:,3);
-        result.BandpassPSD = psd(:,3);
+        "RawQRSCandidates", peakLocations{1}, "FilteredQRSCandidates", peakLocations{2});
+    if ~isempty(bandstopHz)
+        result.BandstopHz = bandstopHz;
+        result.LowpassBandstopVoltage = signals(:,3);
+        result.LowpassBandstopPSD = psd(:,3);
+        result.LowpassBandstopQRSCandidates = peakLocations{3};
     end
 end
 

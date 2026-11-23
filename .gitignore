@@ -1,0 +1,13 @@
+.DS_Store
+*.asv
+*.autosave
+/ArduinoECGRead/
+/ECG Bluetooth Board A.csv
+/Processing.m
+/analysis/
+/ecg_a0_recording.slx
+/morteza-zabihi-208/
+/plotECGRecording.m
+/trainAFDetector.m
+/recordings/*
+!/recordings/ecg_20261123_151617_625.mat
